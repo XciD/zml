@@ -177,6 +177,7 @@ pub const RopeOpts = struct {
             factor: ?f32 = null,
             mscale: ?f32 = null,
             mscale_all_dim: ?f32 = null,
+            partial_rotary_factor: f32 = 1.0,
             truncate: bool = true,
             original_max_position_embeddings: u32,
             rope_theta: f32 = 10000,
@@ -353,11 +354,7 @@ fn _invFreq(opts: RopeOpts, inv_freq: []f32) void {
             for (inv_freq) |*f| f.* /= l.factor;
         },
         .proportional => |p| {
-            const rotary_fraction = std.math.clamp(p.partial_rotary_factor, 0.0, 1.0);
-            const rotary_frequencies: usize = @intFromFloat(@floor(@as(f32, @floatFromInt(N)) * rotary_fraction));
-            for (inv_freq[rotary_frequencies..]) |*f| {
-                f.* = 0;
-            }
+            applyPartialRotaryFactor(p.partial_rotary_factor, inv_freq);
         },
         .llama3 => |s| {
             // https://arxiv.org/pdf/2309.16039
@@ -409,7 +406,16 @@ fn _invFreq(opts: RopeOpts, inv_freq: []f32) void {
                     inv_freq[n] *= @floatCast(lerp + (1 - lerp) * downscaling);
                 }
             }
+            applyPartialRotaryFactor(s.partial_rotary_factor, inv_freq);
         },
+    }
+}
+
+fn applyPartialRotaryFactor(partial_rotary_factor: f32, inv_freq: []f32) void {
+    const rotary_fraction = std.math.clamp(partial_rotary_factor, 0.0, 1.0);
+    const rotary_frequencies: usize = @intFromFloat(@floor(@as(f32, @floatFromInt(inv_freq.len)) * rotary_fraction));
+    for (inv_freq[rotary_frequencies..]) |*f| {
+        f.* = 0;
     }
 }
 
@@ -472,6 +478,27 @@ test "RopeOpts.Scaling parses proportional" {
         .proportional => |p| {
             try std.testing.expectApproxEqRel(0.25, p.partial_rotary_factor, 1e-6);
             try std.testing.expectApproxEqRel(1_000_000, p.rope_theta, 1e-6);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "RopeOpts.Scaling parses yarn partial rotary factor" {
+    const json =
+        \\{
+        \\  "rope_type": "yarn",
+        \\  "factor": 32.0,
+        \\  "original_max_position_embeddings": 4096,
+        \\  "partial_rotary_factor": 0.5
+        \\}
+    ;
+    var value = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer value.deinit();
+
+    const scaling = try RopeOpts.Scaling.jsonParseFromValue(std.testing.allocator, value.value, .{});
+    switch (scaling) {
+        .yarn => |y| {
+            try std.testing.expectApproxEqRel(0.5, y.partial_rotary_factor, 1e-6);
         },
         else => try std.testing.expect(false),
     }
