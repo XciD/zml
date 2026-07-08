@@ -4,6 +4,7 @@ const stdx = @import("stdx");
 
 const VFSBase = @import("base.zig").VFSBase;
 const parallel_read = @import("parallel_read.zig");
+const xet = @import("xet.zig");
 
 const log = std.log.scoped(.@"zml/io/vfs/hf");
 
@@ -151,6 +152,10 @@ pub const HF = struct {
         uri: []const u8,
         pos: u64,
         size: u64,
+        /// Set once we have decided whether this file is XET-backed.
+        xet_tried: bool = false,
+        /// Live xet-core session for range reads, if the file is XET-backed.
+        xet: ?xet.RemoteFile = null,
 
         pub fn init(allocator: std.mem.Allocator, handle_type: Type, uri: []const u8, size: u64) !Handle {
             return .{
@@ -163,6 +168,7 @@ pub const HF = struct {
 
         pub fn deinit(self: *Handle, allocator: std.mem.Allocator) void {
             allocator.free(self.uri);
+            if (self.xet) |*remote| remote.deinit(allocator);
         }
     };
 
@@ -176,6 +182,12 @@ pub const HF = struct {
     base: VFSBase,
     trees: std.StringHashMapUnmanaged(std.ArrayList(TreeNode)) = .{},
     dir_read_states: std.AutoHashMapUnmanaged(*std.Io.Dir.Reader, ReadState) = .{},
+    /// Per-repo XET caches, keyed by "repo_id@rev". The repo tree and read token
+    /// are each fetched once and reused across all files, instead of once per
+    /// file (which rate-limits the Hub API into `too_many_requests`). Guarded by
+    /// `mutex`.
+    xet_trees: std.StringHashMapUnmanaged(xet.XetTree) = .{},
+    xet_tokens: std.StringHashMapUnmanaged(xet.ReadToken) = .{},
 
     pub fn init(allocator: std.mem.Allocator, inner: std.Io, http_client: *std.http.Client, hf_token: ?[]const u8, opts: InitOpts) !HF {
         const read_pool = try allocator.create(ParallelRead.Pool);
@@ -257,6 +269,20 @@ pub const HF = struct {
         }
         self.trees.deinit(self.allocator);
         self.dir_read_states.deinit(self.allocator);
+
+        var xt = self.xet_trees.iterator();
+        while (xt.next()) |entry| {
+            xet.freeTree(self.allocator, entry.value_ptr);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.xet_trees.deinit(self.allocator);
+
+        var tok = self.xet_tokens.iterator();
+        while (tok.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.xet_tokens.deinit(self.allocator);
 
         switch (self.authorization) {
             .default, .omit => {},
@@ -788,6 +814,25 @@ pub const HF = struct {
         read_size = @intCast(@min(handle.size - offset, read_size));
         if (read_size == 0) return 0;
 
+        // XET-backed files: reconstruct the requested range on demand through
+        // xet-core (C-API), which fetches only the covering xorbs and serves
+        // repeated/overlapping ranges from its chunk cache. Non-XET files fall
+        // through to the plain resolve range-GET path below.
+        if (!handle.xet_tried) {
+            handle.xet_tried = true;
+            handle.xet = self.openXet(handle) catch |err| blk: {
+                log.info("xet: falling back to resolve for {s}: {any}", .{ handle.uri, err });
+                break :blk null;
+            };
+        }
+        if (handle.xet) |*remote| {
+            const want = @min(data[0].len, read_size);
+            return remote.readRange(offset, offset + want, data[0][0..want]) catch |err| {
+                log.err("xet range read failed for {s} at {d}: {any}", .{ handle.uri, offset, err });
+                return error.XetReadFailed;
+            };
+        }
+
         const job_count = std.math.divCeil(usize, read_size, self.read_pool.chunk_size) catch unreachable;
 
         const jobs = try self.allocator.alloc(ParallelRead.Job, job_count);
@@ -822,5 +867,60 @@ pub const HF = struct {
         if (batch.executor.firstError()) |err| return err;
 
         return read_size;
+    }
+
+    /// Open a XET-backed file for range reads via xet-core. Returns an error
+    /// for non-XET files, so the caller falls back to the resolve range path.
+    fn openXet(self: *HF, handle: *Handle) !xet.RemoteFile {
+        const repo = try Repo.parse(handle.uri);
+
+        const repo_id = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ repo.repo, repo.model });
+        defer self.allocator.free(repo_id);
+
+        // Fetch the repo tree and read token once per repo (cached under mutex),
+        // not once per file, which otherwise rate-limits the Hub API into
+        // too_many_requests and forces every file onto the resolve fallback.
+        self.mutex.lockUncancelable(self.base.inner);
+        defer self.mutex.unlock(self.base.inner);
+
+        const tree = try self.getOrFetchXetTree(repo_id, repo.rev);
+        const file = tree.get(repo.path) orelse return error.FileNotXetBacked;
+        const token = try self.getOrFetchXetToken(repo_id, repo.rev);
+
+        // Session.init is local (no network) and copies the hash, so building it
+        // under the lock is cheap and keeps the cached token pointer valid.
+        return xet.openWith(self.allocator, file.hash_hexz, file.size, token.*);
+    }
+
+    /// The repo's XET tree, fetched once and cached. Caller must hold `mutex`.
+    fn getOrFetchXetTree(self: *HF, repo_id: []const u8, rev: []const u8) !*const xet.XetTree {
+        var key_buf: [1024]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}@{s}", .{ repo_id, rev }) catch return error.NameTooLong;
+        if (self.xet_trees.getPtr(key)) |cached| return cached;
+
+        var tree = try xet.fetchTree(self.allocator, self.client, self.authorization, "model", repo_id, rev);
+        errdefer xet.freeTree(self.allocator, &tree);
+
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+
+        try self.xet_trees.put(self.allocator, owned_key, tree);
+        return self.xet_trees.getPtr(owned_key).?;
+    }
+
+    /// The repo's XET read token, fetched once and cached. Caller must hold `mutex`.
+    fn getOrFetchXetToken(self: *HF, repo_id: []const u8, rev: []const u8) !*const xet.ReadToken {
+        var key_buf: [1024]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "{s}@{s}", .{ repo_id, rev }) catch return error.NameTooLong;
+        if (self.xet_tokens.getPtr(key)) |cached| return cached;
+
+        const token = try xet.fetchToken(self.allocator, self.client, self.authorization, "model", repo_id, rev);
+        errdefer token.deinit(self.allocator);
+
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+
+        try self.xet_tokens.put(self.allocator, owned_key, token);
+        return self.xet_tokens.getPtr(owned_key).?;
     }
 };
