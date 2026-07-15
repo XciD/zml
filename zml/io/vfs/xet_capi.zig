@@ -23,7 +23,6 @@ const XetSession = opaque {};
 const XetDownloadStreamGroup = opaque {};
 const XetDownloadStream = opaque {};
 const XetFileInfo = opaque {};
-const XetOp = opaque {};
 const XetError = opaque {};
 const XetBytes = opaque {};
 
@@ -41,10 +40,8 @@ const XetAuthConfig = extern struct {
     refresh_header_count: usize,
 };
 
-// XetStatus: 0 = Ok. XetPollState: 0 = Pending, 1 = Ready, 2 = Error.
+// XetStatus: 0 = Ok.
 const XET_OK: c_int = 0;
-const XET_POLL_READY: c_int = 1;
-const XET_POLL_ERROR: c_int = 2;
 
 extern fn xet_session_new(out: *?*XetSession, err: *?*XetError) c_int;
 extern fn xet_session_free(session: ?*XetSession) void;
@@ -53,12 +50,10 @@ extern fn xet_download_stream_group_free(group: ?*XetDownloadStreamGroup) void;
 extern fn xet_file_info_new(hash: [*:0]const u8, file_size: u64, out: *?*XetFileInfo, err: *?*XetError) c_int;
 extern fn xet_file_info_free(fi: ?*XetFileInfo) void;
 extern fn xet_download_stream_group_download_stream(group: ?*XetDownloadStreamGroup, file_info: ?*XetFileInfo, has_range: bool, range_start: u64, range_end: u64, out: *?*XetDownloadStream, err: *?*XetError) c_int;
-extern fn xet_download_stream_next_start(stream: ?*XetDownloadStream, out: *?*XetOp, err: *?*XetError) c_int;
+// Blocking: fetches the next chunk, `*out` is NULL at end of stream. `offset`
+// is only written for unordered streams, so we pass null for ordered reads.
+extern fn xet_download_stream_next(stream: ?*XetDownloadStream, offset: ?*u64, out: *?*XetBytes, err: *?*XetError) c_int;
 extern fn xet_download_stream_free(stream: ?*XetDownloadStream) void;
-extern fn xet_op_poll(op: ?*XetOp) c_int;
-extern fn xet_op_free(op: ?*XetOp) void;
-extern fn xet_op_take_error(op: ?*XetOp, err: *?*XetError) c_int;
-extern fn xet_op_take_bytes(op: ?*XetOp, out: *?*XetBytes, err: *?*XetError) c_int;
 extern fn xet_bytes_data(b: ?*XetBytes) [*]const u8;
 extern fn xet_bytes_len(b: ?*XetBytes) usize;
 extern fn xet_bytes_free(b: ?*XetBytes) void;
@@ -72,29 +67,6 @@ fn capiError(err: ?*XetError) error{XetCapi} {
         xet_error_free(e);
     }
     return error.XetCapi;
-}
-
-/// Block until `op` is ready, then take its bytes. Returns null at EOF.
-fn awaitBytes(op: ?*XetOp) !?*XetBytes {
-    while (true) {
-        switch (xet_op_poll(op)) {
-            XET_POLL_READY => {
-                var bytes: ?*XetBytes = null;
-                var err: ?*XetError = null;
-                if (xet_op_take_bytes(op, &bytes, &err) != XET_OK) return capiError(err);
-                return bytes;
-            },
-            XET_POLL_ERROR => {
-                var err: ?*XetError = null;
-                _ = xet_op_take_error(op, &err);
-                return capiError(err);
-            },
-            else => {
-                var ts: std.c.timespec = .{ .sec = 0, .nsec = std.time.ns_per_ms };
-                _ = std.c.nanosleep(&ts, null);
-            },
-        }
-    }
 }
 
 /// A live xet-core download session bound to one CAS endpoint + token.
@@ -145,18 +117,16 @@ pub const Session = struct {
 
         var written: usize = 0;
         while (written < dest.len) {
-            var op: ?*XetOp = null;
-            if (xet_download_stream_next_start(stream, &op, &err) != XET_OK) return capiError(err);
+            // Blocking call; ordered stream, so `offset` is left null.
+            var bytes: ?*XetBytes = null;
+            if (xet_download_stream_next(stream, null, &bytes, &err) != XET_OK) return capiError(err);
+            const b = bytes orelse break; // null = EOF
 
-            const taken = awaitBytes(op);
-            xet_op_free(op);
-            const bytes = (taken catch |e| return e) orelse break; // null = EOF
-
-            const src = xet_bytes_data(bytes)[0..xet_bytes_len(bytes)];
+            const src = xet_bytes_data(b)[0..xet_bytes_len(b)];
             const n = @min(src.len, dest.len - written);
             @memcpy(dest[written..][0..n], src[0..n]);
             written += n;
-            xet_bytes_free(bytes);
+            xet_bytes_free(b);
         }
         return written;
     }
